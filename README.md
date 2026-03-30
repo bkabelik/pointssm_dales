@@ -13,7 +13,7 @@
 |    Model   |   Benchmark   | Num GPUs | Val mIoU |                                       Tensorboard                                        |             Exp Record              |
 | :--------: |:-------------:|:--------:|:--------:|:----------------------------------------------------------------------------------------:|:-----------------------------------:|
 |    PointSSM    |   nuScenes    |    2     |  80.7%   | [link](exp/nuscenes/semseg-default/events.out.tfevents.1728970636.cv-Z690-GAMING-X-DDR4) | [link](exp/nuscenes/semseg-default) |
-|    PointSSM    | SemanticKITTI |    2     |    –     |                                            –                                             |                  –                  |
+|    PointSSM    | SemanticKITTI |    2     |    70.8%     |                                            –                                             |                  –                  |
 |    PointSSM    |     DALES     |    2     |  82.3%   |                                            -                                             |                  -                  |
 
 ## Data
