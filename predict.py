@@ -96,7 +96,7 @@ def interactive_noise_filter(points):
             
     return mask
 
-def smooth_predictions(points, preds, k=15):
+def smooth_predictions(points, preds, k=30):
     """
     Apply k-NN majority voting smoothing to predictions (good for overlapping flight strips).
     """
@@ -134,10 +134,10 @@ def predict_las(las_file_path, model, transform, cfg, args):
         
     print("Preparing data for PointSSM and splitting into overlapping blocks (Stride: 25m, Size: 50m)...")
     block_size = 50.0  # MUST be 50 to maintain depth=7 Hilbert curve fractal boundaries
-    stride = 25.0      # 50% Overlap to remove edge/tiling artifacts
+    stride = 20.0      # 60% Overlap for maximum consensus at block edges
     
-    # Calculate Global Intensity Scale (99.9th percentile to avoid high-intensity noise)
-    global_intensity_max = np.percentile(intensities, 99.9)
+    # Calculate Global Intensity Scale (99th percentile to avoid high-intensity noise)
+    global_intensity_max = np.percentile(intensities, 99.5) # Slightly lower for more wire contrast
     print(f"Global Intensity Scaling: Reference Max={global_intensity_max:.2f}")
 
     # Drop outliers from the active prediction set to avoid skewing geometric centers in 50m blocks
