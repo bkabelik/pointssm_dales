@@ -1,3 +1,8 @@
+# Modified version of [PointSSM](https://github.com/HQU-3DCV/PointSSM). Updated for DALES LiDAR dataset.
+
+
+
+
 # PointSSM: State Space Model for Large-Scale LiDAR Point Cloud Semantic Segmentation
 ![poster](./PointSSM-poster.png)
 ## Results
