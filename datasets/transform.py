@@ -1199,6 +1199,16 @@ class Collect(object):
         self.kwargs = kwargs
 
     def __call__(self, data_dict):
+        if "strength" in data_dict.keys() and isinstance(data_dict["strength"], torch.Tensor) and data_dict["strength"].dim() == 1:
+            data_dict["strength"] = data_dict["strength"].unsqueeze(-1)
+        elif "strength" in data_dict.keys() and isinstance(data_dict["strength"], np.ndarray) and data_dict["strength"].ndim == 1:
+            data_dict["strength"] = np.expand_dims(data_dict["strength"], -1)
+            
+        if "reflectance" in data_dict.keys() and isinstance(data_dict["reflectance"], torch.Tensor) and data_dict["reflectance"].dim() == 1:
+            data_dict["reflectance"] = data_dict["reflectance"].unsqueeze(-1)
+        elif "reflectance" in data_dict.keys() and isinstance(data_dict["reflectance"], np.ndarray) and data_dict["reflectance"].ndim == 1:
+            data_dict["reflectance"] = np.expand_dims(data_dict["reflectance"], -1)
+
         data = dict()
         if isinstance(self.keys, str):
             self.keys = [self.keys]
@@ -1208,8 +1218,10 @@ class Collect(object):
             data[key] = torch.tensor([data_dict[value].shape[0]])
         for name, keys in self.kwargs.items():
             name = name.replace("_keys", "")
+            if isinstance(keys, str):
+                keys = [keys]
             assert isinstance(keys, Sequence)
-            data[name] = torch.cat([data_dict[key].float() for key in keys], dim=1)
+            data[name] = torch.cat([data_dict[key].float() if data_dict[key].dim() > 1 else data_dict[key].float().unsqueeze(-1) for key in keys], dim=1)
         return data
 
 

@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 16  # bs: total bs in all gpus
+batch_size = 8  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 # enable_amp = True
@@ -49,7 +49,7 @@ param_dicts = [dict(keyword="block", lr=0.0001)]
 
 # dataset settings
 dataset_type = "DALESDataset"
-data_root = "/home/cv/gjl/datasets/dales_noDrop_Normalized"
+data_root = "/home/fractal01/PointSSM/data/dales_noDrop_Normalized"
 ignore_index = -1
 names = [
     "Ground",

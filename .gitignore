@@ -1,0 +1,40 @@
+# Environments and build files
+__pycache__/
+*.py[cod]
+*~
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Checkpoints and Data
+data/
+exp/
+*.pth
+*.ckpt
+
+# Logs
+*.log
+
+# IDEs
+.idea/
+.vscode/
+*.swp

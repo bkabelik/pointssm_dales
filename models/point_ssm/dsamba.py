@@ -31,7 +31,7 @@ class MambaBlock(PointModule):
         mixer_cls = partial(Mamba, d_state=d_state, out_dim=out_dim, bias=False, d_conv=d_conv,
                             **ssm_cfg, **factory_kwargs)
         self.mixer = mixer_cls(dim)
-        # self.norm = norm_cls(dim)
+        self.norm = norm_cls(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.pooling_depth = pooling_depth
 
