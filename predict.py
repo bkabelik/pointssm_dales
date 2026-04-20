@@ -18,12 +18,8 @@ try:
 except ImportError:
     laspy = None
 
-try:
-    import open3d as o3d
-except ImportError:
-    o3d = None
-
 from scipy.spatial import cKDTree
+from noisefilter import run_interactive_filter
 
 def parse_args():
     parser = argparse.ArgumentParser("PointSSM Predictor for LAS files")
@@ -35,66 +31,6 @@ def parse_args():
     parser.add_argument("--options", nargs="+", action="append", help="override some settings in the used config")
     return parser.parse_args()
 
-def interactive_noise_filter(points):
-    """
-    Apply interactive Statistical Outlier Removal (SOR) or Radius Outlier Removal (ROR).
-    Returns boolean mask of points to keep.
-    """
-    if o3d is None:
-        print("Warning: open3d is not installed. Run `pip install open3d` to enable noise filtering. Skipping...")
-        return np.ones(len(points), dtype=bool)
-    
-    print("Converting to Open3D format for filtering...")
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-    
-    # Default parameters: ROR is better for power lines and sparse ground
-    method = "ROR"
-    nb_neighbors = 20
-    std_ratio = 4.0   
-    radius = 2.0     # Expanded radius to catch sparse wires
-    min_points = 2   # Minimal neighbors to keep wires
-    
-    print("\n--- Interactive Noise Filtering ---")
-    print("TIP: If you have a lot of vegetation, SOR with StdRatio < 3.0 is too aggressive.")
-    print("TIP: Try Radius Outlier Removal (ROR) for complex tree canopies.")
-    
-    while True:
-        print(f"\nCurrent Method: {method}")
-        if method == "SOR":
-            print(f"  -> Statistical (SOR): Removing points with z-score > {std_ratio}")
-            cl, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-        else:
-            print(f"  -> Radius (ROR): Keeping points if at least {min_points} neighbors within {radius} meters")
-            cl, ind = pcd.remove_radius_outlier(nb_points=min_points, radius=radius)
-            
-        mask = np.zeros(len(points), dtype=bool)
-        mask[ind] = True
-        
-        noise_pts = len(points) - np.sum(mask)
-        print(f"Result: Filtered {noise_pts} noise points out of {len(points)} ({noise_pts / len(points) * 100:.2f}%).")
-        
-        print("\nOptions:")
-        print(" [a] Accept these parameters and proceed")
-        print(" [s] Switch method (SOR <-> ROR)")
-        print(" [c] Change parameters for current method")
-        choice = input("Your choice [a/s/c]: ").strip().lower()
-        
-        if choice == 'a':
-            break
-        elif choice == 's':
-            method = "ROR" if method == "SOR" else "SOR"
-        elif choice == 'c':
-            if method == "SOR":
-                nb_neighbors = int(input(f"Enter Neighbors (current {nb_neighbors}): ") or nb_neighbors)
-                std_ratio = float(input(f"Enter StdRatio (current {std_ratio}): ") or std_ratio)
-            else:
-                radius = float(input(f"Enter Radius (current {radius}): ") or radius)
-                min_points = int(input(f"Enter MinPoints (current {min_points}): ") or min_points)
-        else:
-            print("Invalid choice. Try again.")
-            
-    return mask
 
 def smooth_predictions(points, preds, k=30):
     """
@@ -126,9 +62,7 @@ def predict_las(las_file_path, model, transform, cfg, args):
     
     # Apply Noise Filter
     if args.noise_filter in ["yes", "interactive"]:
-        # We can simulate an interactive loop, but for terminal simplicity we just run it once.
-        # To make it fully interactive, we'd add input() logic.
-        keep_mask = interactive_noise_filter(points)
+        keep_mask = run_interactive_filter(points, intensities)
     else:
         keep_mask = np.ones(len(points), dtype=bool)
         
