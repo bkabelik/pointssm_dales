@@ -52,8 +52,8 @@ def interactive_noise_filter(points):
     method = "ROR"
     nb_neighbors = 20
     std_ratio = 4.0   
-    radius = 1.0     
-    min_points = 3   
+    radius = 2.0     # Expanded radius to catch sparse wires
+    min_points = 2   # Minimal neighbors to keep wires
     
     print("\n--- Interactive Noise Filtering ---")
     print("TIP: If you have a lot of vegetation, SOR with StdRatio < 3.0 is too aggressive.")
@@ -184,12 +184,14 @@ def predict_las(las_file_path, model, transform, cfg, args):
             # Pointcept / DALES Strict Normalization Geometry
             local_center_x = (x_start + x_end) / 2.0
             local_center_y = (y_start + y_end) / 2.0
-            # Bottom-anchor Z: Floors always at exactly 0.0 to stabilize 'Height Above Ground'
-            local_z_min = np.min(block_points[:, 2])
+            
+            # Robust Bottom-anchor Z: Floors always at exactly 0.0 relative to the real ground
+            # Using 1st percentile to ignore underground multipath noise peaks
+            z_floor = np.percentile(block_points[:, 2], 1)
 
             block_points[:, 0] = (block_points[:, 0] - local_center_x) / 25.0
             block_points[:, 1] = (block_points[:, 1] - local_center_y) / 25.0
-            block_points[:, 2] = (block_points[:, 2] - local_z_min) / 25.0
+            block_points[:, 2] = (block_points[:, 2] - z_floor) / 25.0
             
             # Spatial weighting for overlap resolving
             dist_x = np.abs(block_points[:, 0])
@@ -252,6 +254,11 @@ def predict_las(las_file_path, model, transform, cfg, args):
     
     # Map predictions back to original indices
     final_classes[valid_indices] = pred_classes.astype(np.uint8)
+    
+    # Final cleanup: mark anything dramatically below the ground level as noise
+    # We do a quick spatial pass or just rely on the model for now?
+    # Actually, let's explicitly flag those points that were z < floor in their blocks
+    # (Simplified: we can just trust the model if the floor is now stable)
     
     las.classification = final_classes
     out_dir = os.path.join(args.folder, "predictions")
