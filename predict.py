@@ -128,37 +128,71 @@ def predict_las(las_file_path, model, transform, cfg, args):
     else:
         keep_mask = np.ones(len(points), dtype=bool)
         
-    print("Preparing data for PointSSM and splitting into blocks...")
-    block_size = 50.0  # 50m x 50m blocks to keep point count ~100k
-    
-    # We want to process multiple blocks in a single GPU pass to utilize 24GB VRAM
-    max_batch_blocks = 8 
+    print("Preparing data for PointSSM and splitting into overlapping blocks (Stride: 25m, Size: 50m)...")
+    block_size = 50.0  # MUST be 50 to maintain depth=7 Hilbert curve fractal boundaries
+    stride = 25.0      # 50% Overlap to remove edge/tiling artifacts
     
     min_x, max_x = np.min(points[:, 0]), np.max(points[:, 0])
     min_y, max_y = np.min(points[:, 1]), np.max(points[:, 1])
     
-    global_pred_classes = np.zeros(len(points), dtype=np.int32)
+    global_pred_logits = np.zeros((len(points), cfg.data.num_classes), dtype=np.float32)
     
-    blocks_x = int(np.ceil((max_x - min_x) / block_size))
-    blocks_y = int(np.ceil((max_y - min_y) / block_size))
+    blocks_x = int(np.ceil((max_x - min_x) / stride))
+    blocks_y = int(np.ceil((max_y - min_y) / stride))
     total_blocks = blocks_x * blocks_y
     processed_blocks = 0
     
     model.eval()
     
-    print(f"Splitting into {total_blocks} blocks of {block_size}x{block_size}m...")
-    print("Normalizing blocks to [-1, 1] with Intensity bounds [0, 1] to match DALES training Domain...")
+    print(f"Splitting into {total_blocks} potential overlapping blocks of {block_size}x{block_size}m...")
+    print("Normalizing blocks (Physical Scale localized to 50m DALES patches) ...")
     
-    active_batch = []
-    
-    def process_batch(batch_items):
-        if not batch_items: return
-        print(f"  -> Forwarding batch of {len(batch_items)} blocks to GPU...")
-        
-        for item in batch_items:
-            data_dict = transform(item["data_dict"])
+    for bx in range(blocks_x):
+        for by in range(blocks_y):
+            # Define block boundaries using stride
+            x_start = min_x + bx * stride
+            y_start = min_y + by * stride
+            x_end = x_start + block_size
+            y_end = y_start + block_size
+            
+            x_mask = (points[:, 0] >= x_start) & (points[:, 0] < x_end)
+            y_mask = (points[:, 1] >= y_start) & (points[:, 1] < y_end)
+            block_mask = keep_mask & x_mask & y_mask
+            
+            block_idx = np.where(block_mask)[0]
+            if len(block_idx) == 0:
+                continue
+                
+            processed_blocks += 1
+            print(f"  -> Processing block {processed_blocks} (Points: {len(block_idx)})...")
+            
+            block_points = points[block_idx].copy()
+            block_intensities = intensities[block_idx]
+            
+            x_center = (x_start + x_end) / 2.0
+            y_center = (y_start + y_end) / 2.0
+            # CRITICAL Z FIX: DALES patches are bounded by (max+min)/2, not mean!
+            z_center = (np.max(block_points[:, 2]) + np.min(block_points[:, 2])) / 2.0
+            
+            # Divide by 25.0 consistently to maintain physical density!
+            block_points[:, 0] = (block_points[:, 0] - x_center) / 25.0
+            block_points[:, 1] = (block_points[:, 1] - y_center) / 25.0
+            block_points[:, 2] = (block_points[:, 2] - z_center) / 25.0
+            
+            norm_intensities = block_intensities / 65535.0
+            
+            data_dict = {
+                "coord": block_points,
+                "strength": norm_intensities,
+                "segment": np.zeros(len(block_points), dtype=np.int32),
+                "name": f"b{bx}_{by}"
+            }
+            
+            data_dict = transform(data_dict)
             fragment_list = data_dict["fragment_list"]
             segment = data_dict["segment"]
+            
+            # Aggregate probabilities across fragments back into full block length
             pred = torch.zeros((segment.size, cfg.data.num_classes)).cuda()
             
             for i in range(len(fragment_list)):
@@ -180,62 +214,16 @@ def predict_las(las_file_path, model, transform, cfg, args):
                         pred[idx_part[bs:be], :] += pred_part[bs:be]
                         bs = be
 
-            pred_classes = pred.max(1)[1].data.cpu().numpy()
+            # Move from GPU back to block indices
+            pred_part = pred.cpu().numpy()
             if "inverse" in data_dict.keys():
-                pred_classes = pred_classes[data_dict["inverse"]]
+                pred_part = pred_part[data_dict["inverse"]]
                 
-            global_pred_classes[item["block_idx"]] = pred_classes
-    
-    for bx in range(blocks_x):
-        for by in range(blocks_y):
-            # Define block boundaries
-            x_start = min_x + bx * block_size
-            x_end = x_start + block_size
-            y_start = min_y + by * block_size
-            y_end = y_start + block_size
-            
-            x_mask = (points[:, 0] >= x_start) & (points[:, 0] <= x_end + (1e-3 if bx == blocks_x - 1 else 0))
-            y_mask = (points[:, 1] >= y_start) & (points[:, 1] <= y_end + (1e-3 if by == blocks_y - 1 else 0))
-            block_mask = keep_mask & x_mask & y_mask
-            
-            block_idx = np.where(block_mask)[0]
-            if len(block_idx) == 0:
-                continue
-                
-            processed_blocks += 1
-            
-            block_points = points[block_idx].copy()
-            block_intensities = intensities[block_idx]
-            
-            # Domain Mapping: Scale coordinates to roughly [-1, 1] per DALES block
-            # and Intensity to [0, 1]
-            x_center = (x_start + x_end) / 2.0
-            y_center = (y_start + y_end) / 2.0
-            z_center = np.mean(block_points[:, 2])
-            
-            block_points[:, 0] = (block_points[:, 0] - x_center) / 25.0
-            block_points[:, 1] = (block_points[:, 1] - y_center) / 25.0
-            block_points[:, 2] = (block_points[:, 2] - z_center) / 25.0
-            
-            # Intensity max in 16-bit is normally 65535.
-            # We divide by 65535.0 or dynamic max if it's strangely scaled
-            norm_intensities = block_intensities / 65535.0
-            
-            data_dict = {
-                "coord": block_points,
-                "strength": norm_intensities,
-                "segment": np.zeros(len(block_points), dtype=np.int32),
-                "name": f"{os.path.basename(las_file_path)}_b{bx}_{by}"
-            }
-            
-            active_batch.append({"data_dict": data_dict, "block_idx": block_idx})
-            
-            if len(active_batch) >= max_batch_blocks:
-                process_batch(active_batch)
-                active_batch.clear()
+            # Accumulate Softmax Logits into global space!
+            global_pred_logits[block_idx] += pred_part
 
-    # Flush remaining
-    process_batch(active_batch)
+    # Resolve soft-majority voting overlaps
+    global_pred_classes = np.argmax(global_pred_logits, axis=1)
 
     pred_classes = global_pred_classes[keep_mask]
     norm_points = points[keep_mask].copy() # needed for smoothing
