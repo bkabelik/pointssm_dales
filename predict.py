@@ -48,12 +48,12 @@ def interactive_noise_filter(points):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points[:, :3])
     
-    # Default parameters: Relaxed for LAS vegetation
-    method = "SOR"
+    # Default parameters: ROR is better for power lines and sparse ground
+    method = "ROR"
     nb_neighbors = 20
-    std_ratio = 4.0   # Relaxed (standard is 2.0, which often kills trees)
-    radius = 1.0     # Radius for ROR
-    min_points = 5   # Min points for ROR
+    std_ratio = 4.0   
+    radius = 1.0     
+    min_points = 3   
     
     print("\n--- Interactive Noise Filtering ---")
     print("TIP: If you have a lot of vegetation, SOR with StdRatio < 3.0 is too aggressive.")
@@ -184,11 +184,12 @@ def predict_las(las_file_path, model, transform, cfg, args):
             # Pointcept / DALES Strict Normalization Geometry
             local_center_x = (x_start + x_end) / 2.0
             local_center_y = (y_start + y_end) / 2.0
-            local_center_z = (np.max(block_points[:, 2]) + np.min(block_points[:, 2])) / 2.0
- 
+            # Bottom-anchor Z: Floors always at exactly 0.0 to stabilize 'Height Above Ground'
+            local_z_min = np.min(block_points[:, 2])
+
             block_points[:, 0] = (block_points[:, 0] - local_center_x) / 25.0
             block_points[:, 1] = (block_points[:, 1] - local_center_y) / 25.0
-            block_points[:, 2] = (block_points[:, 2] - local_center_z) / 25.0
+            block_points[:, 2] = (block_points[:, 2] - local_z_min) / 25.0
             
             # Spatial weighting for overlap resolving
             dist_x = np.abs(block_points[:, 0])
