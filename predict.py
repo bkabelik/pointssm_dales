@@ -128,74 +128,118 @@ def predict_las(las_file_path, model, transform, cfg, args):
     else:
         keep_mask = np.ones(len(points), dtype=bool)
         
-    # Pre-processing coordinates and intensities
-    target_points = points[keep_mask]
-    target_intensities = intensities[keep_mask]
+    print("Preparing data for PointSSM and splitting into blocks...")
+    block_size = 50.0  # 50m x 50m blocks to keep point count ~100k
     
-    # Usually coordinate systems shift the XY mean to 0 and Z min to 0.
-    mean_x = np.mean(target_points[:, 0])
-    mean_y = np.mean(target_points[:, 1])
-    min_z = np.min(target_points[:, 2])
+    # We want to process multiple blocks in a single GPU pass to utilize 24GB VRAM
+    max_batch_blocks = 8 
     
-    norm_points = target_points.copy()
-    norm_points[:, 0] -= mean_x
-    norm_points[:, 1] -= mean_y
-    norm_points[:, 2] -= min_z
+    min_x, max_x = np.min(points[:, 0]), np.max(points[:, 0])
+    min_y, max_y = np.min(points[:, 1]), np.max(points[:, 1])
     
-    # DALES dataset scale for PointSSM: it expects `coord` and `strength`
-    # Let's see if DALES model expects intensities 0-65535.
-    # Often models work better with normalized 0-1 intensities or similar, but the DALES dataset 
-    # uses 16bit intensities raw. We leave target_intensities as is, as `strength` passes directly.
+    global_pred_classes = np.zeros(len(points), dtype=np.int32)
     
-    print("Preparing data for PointSSM...")
-    data_dict = {
-        "coord": norm_points,
-        "strength": target_intensities,
-        "segment": np.zeros(len(norm_points), dtype=np.int32),  # Dummy
-        "name": os.path.basename(las_file_path)
-    }
-    
-    # Apply test config transform (usually GridSample, ToTensor, Collect)
-    data_dict = transform(data_dict)
-    
-    # Predict in chunks/fragments as done in PointSSM SemSegTester
-    # The GridSample in test split creates grid components.
-    # Actually, the test_cfg manages voxelization natively if specified.
-    # Let's emulate SemSegTester fragment prediction logic.
+    blocks_x = int(np.ceil((max_x - min_x) / block_size))
+    blocks_y = int(np.ceil((max_y - min_y) / block_size))
+    total_blocks = blocks_x * blocks_y
+    processed_blocks = 0
     
     model.eval()
     
-    fragment_list = data_dict["fragment_list"]
-    segment = data_dict["segment"]
-    pred = torch.zeros((segment.size, cfg.data.num_classes)).cuda()
+    print(f"Splitting into {total_blocks} blocks of {block_size}x{block_size}m...")
+    print("Normalizing blocks to [-1, 1] with Intensity bounds [0, 1] to match DALES training Domain...")
     
-    print("Running inference...")
-    for i in range(len(fragment_list)):
-        input_dict = fragment_list[i]
-        # Wrap things into batch size 1
-        from datasets import collate_fn
-        input_dict = collate_fn([input_dict])
+    active_batch = []
+    
+    def process_batch(batch_items):
+        if not batch_items: return
+        print(f"  -> Forwarding batch of {len(batch_items)} blocks to GPU...")
         
-        for key in input_dict.keys():
-            if isinstance(input_dict[key], torch.Tensor):
-                input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                
-        idx_part = input_dict["index"]
-        with torch.no_grad():
-            pred_part = model(input_dict)["seg_logits"]
-            pred_part = F.softmax(pred_part, -1)
+        for item in batch_items:
+            data_dict = transform(item["data_dict"])
+            fragment_list = data_dict["fragment_list"]
+            segment = data_dict["segment"]
+            pred = torch.zeros((segment.size, cfg.data.num_classes)).cuda()
             
-            bs = 0
-            for be in input_dict["offset"]:
-                pred[idx_part[bs:be], :] += pred_part[bs:be]
-                bs = be
+            for i in range(len(fragment_list)):
+                input_dict = fragment_list[i]
+                from datasets import collate_fn
+                input_dict = collate_fn([input_dict])
+                
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                        
+                idx_part = input_dict["index"]
+                with torch.no_grad():
+                    pred_part = model(input_dict)["seg_logits"]
+                    pred_part = F.softmax(pred_part, -1)
+                    
+                    bs = 0
+                    for be in input_dict["offset"]:
+                        pred[idx_part[bs:be], :] += pred_part[bs:be]
+                        bs = be
 
-    pred_classes = pred.max(1)[1].data.cpu().numpy()
+            pred_classes = pred.max(1)[1].data.cpu().numpy()
+            if "inverse" in data_dict.keys():
+                pred_classes = pred_classes[data_dict["inverse"]]
+                
+            global_pred_classes[item["block_idx"]] = pred_classes
     
-    if "inverse" in data_dict.keys():
-        pred_classes = pred_classes[data_dict["inverse"]]
-        
-    print("Prediction complete.")
+    for bx in range(blocks_x):
+        for by in range(blocks_y):
+            # Define block boundaries
+            x_start = min_x + bx * block_size
+            x_end = x_start + block_size
+            y_start = min_y + by * block_size
+            y_end = y_start + block_size
+            
+            x_mask = (points[:, 0] >= x_start) & (points[:, 0] <= x_end + (1e-3 if bx == blocks_x - 1 else 0))
+            y_mask = (points[:, 1] >= y_start) & (points[:, 1] <= y_end + (1e-3 if by == blocks_y - 1 else 0))
+            block_mask = keep_mask & x_mask & y_mask
+            
+            block_idx = np.where(block_mask)[0]
+            if len(block_idx) == 0:
+                continue
+                
+            processed_blocks += 1
+            
+            block_points = points[block_idx].copy()
+            block_intensities = intensities[block_idx]
+            
+            # Domain Mapping: Scale coordinates to roughly [-1, 1] per DALES block
+            # and Intensity to [0, 1]
+            x_center = (x_start + x_end) / 2.0
+            y_center = (y_start + y_end) / 2.0
+            z_center = np.mean(block_points[:, 2])
+            
+            block_points[:, 0] = (block_points[:, 0] - x_center) / 25.0
+            block_points[:, 1] = (block_points[:, 1] - y_center) / 25.0
+            block_points[:, 2] = (block_points[:, 2] - z_center) / 25.0
+            
+            # Intensity max in 16-bit is normally 65535.
+            # We divide by 65535.0 or dynamic max if it's strangely scaled
+            norm_intensities = block_intensities / 65535.0
+            
+            data_dict = {
+                "coord": block_points,
+                "strength": norm_intensities,
+                "segment": np.zeros(len(block_points), dtype=np.int32),
+                "name": f"{os.path.basename(las_file_path)}_b{bx}_{by}"
+            }
+            
+            active_batch.append({"data_dict": data_dict, "block_idx": block_idx})
+            
+            if len(active_batch) >= max_batch_blocks:
+                process_batch(active_batch)
+                active_batch.clear()
+
+    # Flush remaining
+    process_batch(active_batch)
+
+    pred_classes = global_pred_classes[keep_mask]
+    norm_points = points[keep_mask].copy() # needed for smoothing
+    print(f"Prediction complete for {processed_blocks} valid blocks.")
     
     # Smoothing
     if args.smoothing == "yes":
@@ -203,13 +247,10 @@ def predict_las(las_file_path, model, transform, cfg, args):
         
     # Reassemble and Write LAS
     print("Reassembling LAS and writing output...")
-    # Initialize all points with a default unclassified class (e.g. 0)
     final_classes = np.zeros(len(points), dtype=np.uint8)
-    # The DALES dataset classes in config:
-    # 0: Ground, 1: Veg, 2: Cars, 3: Trucks, 4: Power lines, 5: Fences, 6: Poles, 7: Buildings
     
-    from datasets.dales import VALID_CLASS_IDS
-    id2class = VALID_CLASS_IDS # maps contiguous id 0..7 to DALES native class (usually 0 is Ground, 1 is Veg, etc.)
+    # Map network output [0..7] back to official DALES [1..8] classes
+    id2class = np.array([1, 2, 3, 4, 5, 6, 7, 8]) 
     
     mapped_classes = id2class[pred_classes].astype(np.uint8)
     final_classes[keep_mask] = mapped_classes
@@ -261,11 +302,13 @@ def main():
                 # To create fragments for grid_sample based inference
                 fragment_list = []
                 data_dict_copy = copy.deepcopy(data_dict)
-                data_part = voxelize_op(data_dict_copy)
+                data_part_list = voxelize_op(data_dict_copy)
                 
-                # Assume no aug_transform for simple prediction
-                data_part = post_transform(data_part)
-                fragment_list.append(data_part)
+                if isinstance(data_part_list, list):
+                    for data_part in data_part_list:
+                        fragment_list.append(post_transform(data_part))
+                else:
+                    fragment_list.append(post_transform(data_part_list))
                 data_dict["fragment_list"] = fragment_list
             return data_dict
             
