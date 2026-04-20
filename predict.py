@@ -48,20 +48,24 @@ def interactive_noise_filter(points):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points[:, :3])
     
-    # Default parameters
+    # Default parameters: Relaxed for LAS vegetation
     method = "SOR"
     nb_neighbors = 20
-    std_ratio = 2.0
-    radius = 0.5
-    min_points = 10
+    std_ratio = 4.0   # Relaxed (standard is 2.0, which often kills trees)
+    radius = 1.0     # Radius for ROR
+    min_points = 5   # Min points for ROR
+    
+    print("\n--- Interactive Noise Filtering ---")
+    print("TIP: If you have a lot of vegetation, SOR with StdRatio < 3.0 is too aggressive.")
+    print("TIP: Try Radius Outlier Removal (ROR) for complex tree canopies.")
     
     while True:
-        print(f"\nCurrent Filter: {method}")
+        print(f"\nCurrent Method: {method}")
         if method == "SOR":
-            print(f"Parameters: Neighbors={nb_neighbors}, StdRatio={std_ratio}")
+            print(f"  -> Statistical (SOR): Removing points with z-score > {std_ratio}")
             cl, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
         else:
-            print(f"Parameters: Radius={radius}, MinPoints={min_points}")
+            print(f"  -> Radius (ROR): Keeping points if at least {min_points} neighbors within {radius} meters")
             cl, ind = pcd.remove_radius_outlier(nb_points=min_points, radius=radius)
             
         mask = np.zeros(len(points), dtype=bool)
@@ -132,20 +136,27 @@ def predict_las(las_file_path, model, transform, cfg, args):
     block_size = 50.0  # MUST be 50 to maintain depth=7 Hilbert curve fractal boundaries
     stride = 25.0      # 50% Overlap to remove edge/tiling artifacts
     
-    min_x, max_x = np.min(points[:, 0]), np.max(points[:, 0])
-    min_y, max_y = np.min(points[:, 1]), np.max(points[:, 1])
+    # Calculate Global Intensity Scale (99.9th percentile to avoid high-intensity noise)
+    global_intensity_max = np.percentile(intensities, 99.9)
+    print(f"Global Intensity Scaling: Reference Max={global_intensity_max:.2f}")
+
+    # Drop outliers from the active prediction set to avoid skewing geometric centers in 50m blocks
+    valid_points = points[keep_mask].astype(np.float32)
+    valid_intensities = intensities[keep_mask].astype(np.float32)
+    valid_indices = np.where(keep_mask)[0]
     
-    global_pred_logits = np.zeros((len(points), cfg.data.num_classes), dtype=np.float32)
+    global_pred_logits = np.zeros((len(valid_points), cfg.data.num_classes), dtype=np.float32)
     
+    model.eval()
+    
+    min_x, max_x = np.min(valid_points[:, 0]), np.max(valid_points[:, 0])
+    min_y, max_y = np.min(valid_points[:, 1]), np.max(valid_points[:, 1])
     blocks_x = int(np.ceil((max_x - min_x) / stride))
     blocks_y = int(np.ceil((max_y - min_y) / stride))
     total_blocks = blocks_x * blocks_y
     processed_blocks = 0
-    
-    model.eval()
-    
+
     print(f"Splitting into {total_blocks} potential overlapping blocks of {block_size}x{block_size}m...")
-    print("Normalizing blocks (Physical Scale localized to 50m DALES patches) ...")
     
     for bx in range(blocks_x):
         for by in range(blocks_y):
@@ -155,31 +166,38 @@ def predict_las(las_file_path, model, transform, cfg, args):
             x_end = x_start + block_size
             y_end = y_start + block_size
             
-            x_mask = (points[:, 0] >= x_start) & (points[:, 0] < x_end)
-            y_mask = (points[:, 1] >= y_start) & (points[:, 1] < y_end)
-            block_mask = keep_mask & x_mask & y_mask
+            x_mask = (valid_points[:, 0] >= x_start) & (valid_points[:, 0] < x_end)
+            y_mask = (valid_points[:, 1] >= y_start) & (valid_points[:, 1] < y_end)
+            block_mask = x_mask & y_mask
             
             block_idx = np.where(block_mask)[0]
-            if len(block_idx) == 0:
+            if len(block_idx) < 10:
                 continue
                 
             processed_blocks += 1
-            print(f"  -> Processing block {processed_blocks} (Points: {len(block_idx)})...")
+            if processed_blocks % 5 == 0:
+                print(f"  -> Processing block {processed_blocks}/{total_blocks} (Points: {len(block_idx)})...")
             
-            block_points = points[block_idx].copy()
-            block_intensities = intensities[block_idx]
+            block_points = valid_points[block_idx].copy()
+            block_intensities = valid_intensities[block_idx]
             
-            x_center = (x_start + x_end) / 2.0
-            y_center = (y_start + y_end) / 2.0
-            # CRITICAL Z FIX: DALES patches are bounded by (max+min)/2, not mean!
-            z_center = (np.max(block_points[:, 2]) + np.min(block_points[:, 2])) / 2.0
+            # Pointcept / DALES Strict Normalization Geometry
+            local_center_x = (x_start + x_end) / 2.0
+            local_center_y = (y_start + y_end) / 2.0
+            local_center_z = (np.max(block_points[:, 2]) + np.min(block_points[:, 2])) / 2.0
+ 
+            block_points[:, 0] = (block_points[:, 0] - local_center_x) / 25.0
+            block_points[:, 1] = (block_points[:, 1] - local_center_y) / 25.0
+            block_points[:, 2] = (block_points[:, 2] - local_center_z) / 25.0
             
-            # Divide by 25.0 consistently to maintain physical density!
-            block_points[:, 0] = (block_points[:, 0] - x_center) / 25.0
-            block_points[:, 1] = (block_points[:, 1] - y_center) / 25.0
-            block_points[:, 2] = (block_points[:, 2] - z_center) / 25.0
+            # Spatial weighting for overlap resolving
+            dist_x = np.abs(block_points[:, 0])
+            dist_y = np.abs(block_points[:, 1])
+            weights = 1.0 - np.maximum(dist_x, dist_y)
+            weights = np.clip(weights, 0.1, 1.0)
             
-            norm_intensities = block_intensities / 65535.0
+            # Intensity normalization: Global scaling to maintain material contrast
+            norm_intensities = np.clip(block_intensities / (global_intensity_max + 1e-6), 0, 1)
             
             data_dict = {
                 "coord": block_points,
@@ -199,7 +217,6 @@ def predict_las(las_file_path, model, transform, cfg, args):
                 input_dict = fragment_list[i]
                 from datasets import collate_fn
                 input_dict = collate_fn([input_dict])
-                
                 for key in input_dict.keys():
                     if isinstance(input_dict[key], torch.Tensor):
                         input_dict[key] = input_dict[key].cuda(non_blocking=True)
@@ -208,7 +225,6 @@ def predict_las(las_file_path, model, transform, cfg, args):
                 with torch.no_grad():
                     pred_part = model(input_dict)["seg_logits"]
                     pred_part = F.softmax(pred_part, -1)
-                    
                     bs = 0
                     for be in input_dict["offset"]:
                         pred[idx_part[bs:be], :] += pred_part[bs:be]
@@ -219,29 +235,22 @@ def predict_las(las_file_path, model, transform, cfg, args):
             if "inverse" in data_dict.keys():
                 pred_part = pred_part[data_dict["inverse"]]
                 
-            # Accumulate Softmax Logits into global space!
-            global_pred_logits[block_idx] += pred_part
+            global_pred_logits[block_idx] += (pred_part * weights[:, np.newaxis])
 
-    # Resolve soft-majority voting overlaps
-    global_pred_classes = np.argmax(global_pred_logits, axis=1)
-
-    pred_classes = global_pred_classes[keep_mask]
-    norm_points = points[keep_mask].copy() # needed for smoothing
-    print(f"Prediction complete for {processed_blocks} valid blocks.")
+    # Final Softmax Aggregation
+    pred_classes = np.argmax(global_pred_logits, axis=1)
     
     # Smoothing
     if args.smoothing == "yes":
-        pred_classes = smooth_predictions(norm_points, pred_classes)
+        pred_classes = smooth_predictions(valid_points, pred_classes)
         
-    # Reassemble and Write LAS
+    print(f"Prediction complete for {processed_blocks} blocks.")
     print("Reassembling LAS and writing output...")
-    final_classes = np.zeros(len(points), dtype=np.uint8)
+    # Initialize with 15 (Noise) as default for filtered points
+    final_classes = np.full(len(points), 15, dtype=np.uint8)
     
-    # Map network output [0..7] back to official DALES [1..8] classes
-    id2class = np.array([1, 2, 3, 4, 5, 6, 7, 8]) 
-    
-    mapped_classes = id2class[pred_classes].astype(np.uint8)
-    final_classes[keep_mask] = mapped_classes
+    # Map predictions back to original indices
+    final_classes[valid_indices] = pred_classes.astype(np.uint8)
     
     las.classification = final_classes
     out_dir = os.path.join(args.folder, "predictions")
