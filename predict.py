@@ -19,7 +19,7 @@ except ImportError:
     laspy = None
 
 from scipy.spatial import cKDTree
-from noisefilter import run_interactive_filter
+from noisefilter import run_interactive_filter, apply_headless_filter
 
 def parse_args():
     parser = argparse.ArgumentParser("PointSSM Predictor for LAS files")
@@ -48,6 +48,13 @@ def smooth_predictions(points, preds, k=30):
     
     return smoothed_preds
 
+# Global state to store persistent filter parameters across tiles
+persistent_filter_config = {
+    "params": None,
+    "active": None,
+    "apply_to_all": False
+}
+
 def predict_las(las_file_path, model, transform, cfg, args):
     if laspy is None:
         raise ImportError("laspy is not installed. Please install it (pip install laspy[lazrs,pylas]).")
@@ -61,8 +68,19 @@ def predict_las(las_file_path, model, transform, cfg, args):
     intensities = np.array(las.intensity).astype(np.float32)
     
     # Apply Noise Filter
+    global persistent_filter_config
     if args.noise_filter in ["yes", "interactive"]:
-        keep_mask = run_interactive_filter(points, intensities)
+        if persistent_filter_config["apply_to_all"]:
+            print(f"Applying persistent filter settings to {os.path.basename(las_file_path)}...")
+            keep_mask = apply_headless_filter(points, intensities, 
+                                            persistent_filter_config["params"], 
+                                            persistent_filter_config["active"])
+        else:
+            keep_mask, params, active, apply_to_all = run_interactive_filter(points, intensities)
+            if apply_to_all:
+                persistent_filter_config["params"] = params
+                persistent_filter_config["active"] = active
+                persistent_filter_config["apply_to_all"] = True
     else:
         keep_mask = np.ones(len(points), dtype=bool)
         
@@ -182,17 +200,17 @@ def predict_las(las_file_path, model, transform, cfg, args):
         pred_classes = smooth_predictions(valid_points, pred_classes)
         
     print(f"Prediction complete for {processed_blocks} blocks.")
-    print("Reassembling LAS and writing output...")
-    # Initialize with 15 (Noise) as default for filtered points
-    final_classes = np.full(len(points), 15, dtype=np.uint8)
+    print("Reassembling LAS and writing output with ASPRS mapping...")
+    # Remap DALES (0-7) to ASPRS codes:
+    # 0->2, 1->5, 2->20, 3->20, 4->14, 5->19, 6->15, 7->6
+    id2asprs = np.array([2, 5, 20, 20, 14, 19, 15, 6], dtype=np.uint8)
+    asprs_preds = id2asprs[pred_classes]
+
+    # Initialize with ASPRS 7 (Low Noise) as default for filtered points
+    final_classes = np.full(len(points), 7, dtype=np.uint8)
     
     # Map predictions back to original indices
-    final_classes[valid_indices] = pred_classes.astype(np.uint8)
-    
-    # Final cleanup: mark anything dramatically below the ground level as noise
-    # We do a quick spatial pass or just rely on the model for now?
-    # Actually, let's explicitly flag those points that were z < floor in their blocks
-    # (Simplified: we can just trust the model if the floor is now stable)
+    final_classes[valid_indices] = asprs_preds
     
     las.classification = final_classes
     out_dir = os.path.join(args.folder, "predictions")

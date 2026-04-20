@@ -2,13 +2,13 @@
 
 
 ## Usage:
-###train: 
+### train: 
 sh scripts/train.sh -p python -d dales -c semseg-pointssm-base -n semseg-dales-12 -g 1
 
-###predict:
+### predict:
 python3 predict.py --folder /home/fractal01/PointSSM/data/demo_tennet --model_path exp/dales/semseg-dales-12/model/model_best.pth --config_file /home/fractal01/PointSSM/exp/dales/semseg-dales-12/config.py
 
-###args:
+### args:
     parser.add_argument("--folder", type=str, required=True, help="Folder containing .las files")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model checkpoint (e.g., model_best.pth)")
     parser.add_argument("--config_file", type=str, default="configs/dales/semseg-dales-12.py", help="Model config file")
@@ -16,7 +16,7 @@ python3 predict.py --folder /home/fractal01/PointSSM/data/demo_tennet --model_pa
     parser.add_argument("--smoothing", choices=["yes", "no"], default="yes", help="Enable majority voting smoothing")
     parser.add_argument("--options", nargs="+", action="append", help="override some settings in the used config")
 
-###interactive noise viewer:
+### interactive noise viewer:
 
 Quick Start Guide for the New GUI
 When you run python predict.py ... --noise_filter interactive, the new Open3D window will open. Here is how to use it:

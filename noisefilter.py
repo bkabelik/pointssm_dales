@@ -35,6 +35,7 @@ class NoiseFilterApp:
             "floor": True,
             "intensity": False
         }
+        self.apply_to_all = False
 
         # Setup GUI
         gui.Application.instance.initialize()
@@ -98,10 +99,17 @@ class NoiseFilterApp:
             ("Min Intensity", "intensity_min", 0.0, 1.0, 0.0)
         ]))
 
-        # Confirm Button
-        btn_confirm = gui.Button("Accept & Continue Prediction")
-        btn_confirm.set_on_clicked(self._on_confirm)
-        self.panel.add_child(btn_confirm)
+        # Confirm Buttons
+        hbox_btns = gui.Horiz(0.5 * em)
+        btn_tile = gui.Button("Accept this tile")
+        btn_tile.set_on_clicked(self._on_confirm_tile)
+        hbox_btns.add_child(btn_tile)
+        
+        btn_all = gui.Button("Use for ALL tiles")
+        btn_all.set_on_clicked(self._on_confirm_all)
+        hbox_btns.add_child(btn_all)
+        
+        self.panel.add_child(hbox_btns)
         
         self.window.add_child(self.scene)
         self.window.add_child(self.panel)
@@ -217,13 +225,53 @@ class NoiseFilterApp:
         percent = (outlier_count / len(self.points)) * 100
         self.label_stats.text = f"Outliers: {outlier_count:,} ({percent:.2f}%)"
 
-    def _on_confirm(self):
+    def _on_confirm_tile(self):
+        self.apply_to_all = False
+        gui.Application.instance.quit()
+
+    def _on_confirm_all(self):
+        self.apply_to_all = True
         gui.Application.instance.quit()
 
     def run(self):
         gui.Application.instance.run()
-        return self.mask
+        return self.mask, self.params, self.active_filters, self.apply_to_all
 
 def run_interactive_filter(points, intensities=None):
     app = NoiseFilterApp(points, intensities)
     return app.run()
+
+def apply_headless_filter(points, intensities, params, active_filters):
+    """
+    Run the noise filters without a GUI using provided parameters.
+    """
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
+    combined_mask = np.ones(len(points), dtype=bool)
+    
+    if active_filters.get("floor", False):
+        z_floor = np.percentile(points[:, 2], params["floor_percentile"])
+        combined_mask &= (points[:, 2] >= z_floor - params["floor_buffer"])
+        
+    if active_filters.get("ror", False):
+        _, ind = pcd.remove_radius_outlier(nb_points=int(params["ror_min_points"]), 
+                                            radius=params["ror_radius"])
+        m = np.zeros(len(points), dtype=bool); m[ind] = True
+        combined_mask &= m
+        
+    if active_filters.get("sor", False):
+        _, ind = pcd.remove_statistical_outlier(nb_neighbors=int(params["sor_neighbors"]), 
+                                                std_ratio=params["sor_std_ratio"])
+        m = np.zeros(len(points), dtype=bool); m[ind] = True
+        combined_mask &= m
+        
+    if active_filters.get("dbscan", False):
+        labels = np.array(pcd.cluster_dbscan(eps=params["dbscan_eps"], 
+                                            min_points=int(params["dbscan_min_points"])))
+        combined_mask &= (labels >= 0)
+        
+    if active_filters.get("intensity", False) and intensities is not None:
+        max_i = np.max(intensities) + 1e-6
+        combined_mask &= (intensities / max_i >= params["intensity_min"])
+        
+    return combined_mask
