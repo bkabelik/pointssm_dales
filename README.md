@@ -21,11 +21,11 @@ python3 predict.py --folder /home/fractal01/PointSSM/data/demo_tennet --model_pa
 Quick Start Guide for the New GUI
 When you run python predict.py ... --noise_filter interactive, the new Open3D window will open. Here is how to use it:
 
-*Visualizing Noise: Valid points appear in a blue/cyan color ramp (by elevation). As you enable filters and move sliders, points identified as noise will immediately turn White.
-*Killing Underground Noise: In the Ground Elevation Filter tab, enable the filter and adjust the Floor Percentile (usually 1%) and Buffer. Anything in White is now "underground" noise that won't affect the model.
-*Preserving Power Lines: Use the Radius Outlier (ROR) section. If wires are turning white, increase the Radius. I've set the default Min Points to 2 so as long as a wire has one neighbor, it stays.
-*Cleaning Air Noise: Use the DBSCAN section. Increase the Min Cluster Size to delete larger clumps of birds or sensor artifacts.
-*Finishing: Once the point cloud looks clean (only real features are colored, noise is white), click Accept & Continue Prediction.
+* Visualizing Noise: Valid points appear in a blue/cyan color ramp (by elevation). As you enable filters and move sliders, points identified as noise will immediately turn White.
+* Killing Underground Noise: In the Ground Elevation Filter tab, enable the filter and adjust the Floor Percentile (usually 1%) and Buffer. Anything in White is now "underground" noise that won't affect the model.
+* Preserving Power Lines: Use the Radius Outlier (ROR) section. If wires are turning white, increase the Radius. I've set the default Min Points to 2 so as long as a wire has one neighbor, it stays.
+* Cleaning Air Noise: Use the DBSCAN section. Increase the Min Cluster Size to delete larger clumps of birds or sensor artifacts.
+* Finishing: Once the point cloud looks clean (only real features are colored, noise is white), click Accept & Continue Prediction.
 
 
 
