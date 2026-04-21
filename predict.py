@@ -146,7 +146,9 @@ def predict_las(las_file_path, model, transform, cfg, args):
             print(f"Applying persistent filter settings to {os.path.basename(las_file_path)}...")
             keep_mask = apply_headless_filter(points, intensities, 
                                             persistent_filter_config["params"], 
-                                            persistent_filter_config["active"])
+                                            persistent_filter_config["active"],
+                                            return_num=return_num,
+                                            total_returns=total_returns)
         else:
             keep_mask, params, active, apply_to_all = run_interactive_filter(points, intensities)
             if apply_to_all:

@@ -4,6 +4,59 @@ import open3d.visualization.rendering as rendering
 import numpy as np
 from scipy.spatial import cKDTree
 
+def build_ground_model(points, return_num=None, total_returns=None, grid_size=5.0):
+    """
+    Build a coarse ground model for height-relative filtering.
+    """
+    if return_num is not None and total_returns is not None:
+        mask = (return_num == total_returns)
+        ground_pts = points[mask]
+    else:
+        ground_pts = points
+        
+    if len(ground_pts) < 100:
+        ground_pts = points
+        
+    min_x, min_y = np.min(points[:, 0]), np.min(points[:, 1])
+    max_x, max_y = np.max(points[:, 0]), np.max(points[:, 1])
+    nx = int(np.ceil((max_x - min_x) / grid_size)) + 1
+    ny = int(np.ceil((max_y - min_y) / grid_size)) + 1
+    
+    global_floor = np.percentile(ground_pts[:, 2], 1)
+    grid = np.full((nx, ny), global_floor, dtype=np.float32)
+    gx = ((ground_pts[:, 0] - min_x) / grid_size).astype(int)
+    gy = ((ground_pts[:, 1] - min_y) / grid_size).astype(int)
+    
+    for i in range(len(ground_pts)):
+        if ground_pts[i, 2] < grid[gx[i], gy[i]]:
+            grid[gx[i], gy[i]] = ground_pts[i, 2]
+            
+    return grid, (min_x, min_y), grid_size
+
+def get_heights_above_ground(points, ground_model):
+    grid, (min_x, min_y), grid_size = ground_model
+    gx = ((points[:, 0] - min_x) / grid_size).astype(int)
+    gy = ((points[:, 1] - min_y) / grid_size).astype(int)
+    gx = np.clip(gx, 0, grid.shape[0] - 1)
+    gy = np.clip(gy, 0, grid.shape[1] - 1)
+    return points[:, 2] - grid[gx, gy]
+
+def calculate_cluster_linearity(points):
+    """
+    Calculate linearity for a set of points using eigenvalues of the covariance matrix.
+    L = (e1 - e2) / e1. Near 1.0 for lines (wires), near 0.0 for blobs.
+    """
+    if len(points) < 5: # Too few points to reliably determine linearity
+        return 0
+    try:
+        cov = np.cov(points, rowvar=False)
+        evals = np.linalg.eigvalsh(cov) # Sorted ascending: e3, e2, e1
+        e1, e2 = evals[2], evals[1]
+        if e1 < 1e-9: return 0
+        return (e1 - e2) / e1
+    except:
+        return 0
+
 class NoiseFilterApp:
     def __init__(self, points, intensities=None):
         self.points = points
@@ -23,6 +76,8 @@ class NoiseFilterApp:
             "ror_min_points": 2,
             "dbscan_eps": 0.5,
             "dbscan_min_points": 10,
+            "dbscan_base_alt": 5.0,     # New: Noise zone starts at 5m
+            "dbscan_linearity": 0.85,    # New: Clusters more linear than this are protected
             "floor_percentile": 1.0,
             "floor_buffer": 0.5,
             "intensity_min": 0.0
@@ -91,7 +146,9 @@ class NoiseFilterApp:
         # Section: DBSCAN
         self.panel.add_child(self._create_filter_section("DBSCAN (Air Clusters)", "dbscan", [
             ("Eps distance", "dbscan_eps", 0.1, 5.0, 0.5),
-            ("Min Cluster Size", "dbscan_min_points", 2, 500, 10)
+            ("Min Cluster Size", "dbscan_min_points", 2, 500, 10),
+            ("Base Altitude (m)", "dbscan_base_alt", 0.0, 50.0, 5.0),
+            ("Linearity Protect", "dbscan_linearity", 0.0, 1.0, 0.85)
         ]))
 
         # Section: Intensity
@@ -170,6 +227,14 @@ class NoiseFilterApp:
         print("Re-calculating filters...")
         combined_mask = np.ones(len(self.points), dtype=bool)
         
+        # Pre-calc Height Above Ground (using 1st percentile current block for GUI speed)
+        # In headless/predict.py we pass the full DTM
+        try:
+            z_floor = np.percentile(self.points[:, 2], 1.0)
+            heights = self.points[:, 2] - z_floor
+        except:
+            heights = np.zeros(len(self.points))
+        
         # 1. Floor Filter
         if self.active_filters["floor"]:
             z_floor = np.percentile(self.points[:, 2], self.params["floor_percentile"])
@@ -193,13 +258,40 @@ class NoiseFilterApp:
             sor_mask[ind] = True
             combined_mask &= sor_mask
             
-        # 4. DBSCAN Filter
+        # 4. DBSCAN Filter with Height & Linearity Protection
         if self.active_filters["dbscan"]:
-            labels = np.array(self.pcd.cluster_dbscan(eps=self.params["dbscan_eps"], 
-                                                   min_points=int(self.params["dbscan_min_points"])))
-            # Keep only points that are part of a cluster (label >= 0)
-            dbscan_mask = (labels >= 0)
-            combined_mask &= dbscan_mask
+            # Only consider points above the base altitude as noise candidates
+            noise_candidate_indices = np.where(heights > self.params["dbscan_base_alt"])[0]
+            if len(noise_candidate_indices) > 0:
+                # Subset cloud for faster DBSCAN
+                pcd_temp = o3d.geometry.PointCloud()
+                pcd_temp.points = o3d.utility.Vector3dVector(self.points[noise_candidate_indices])
+                
+                labels = np.array(pcd_temp.cluster_dbscan(eps=self.params["dbscan_eps"], 
+                                                       min_points=int(self.params["dbscan_min_points"])))
+                
+                noisy_subset_mask = (labels < 0) # Initially, everything not in a cluster is noise
+                
+                # Check identified clusters for Linearity (Power Line Protection)
+                num_clusters = labels.max() + 1
+                for i in range(num_clusters):
+                    cluster_indices = np.where(labels == i)[0]
+                    # If cluster is too small, it's noise
+                    if len(cluster_indices) < self.params["dbscan_min_points"]:
+                        noisy_subset_mask[cluster_indices] = True
+                    else:
+                        # Test for linearity
+                        lin = calculate_cluster_linearity(self.points[noise_candidate_indices[cluster_indices]])
+                        if lin < self.params["dbscan_linearity"]:
+                            # It's a blob-like air cluster (noise/bird/multi-path)
+                            noisy_subset_mask[cluster_indices] = True
+                        else:
+                            # It's a linear feature (wire)! KEEP IT.
+                            noisy_subset_mask[cluster_indices] = False
+                
+                dbscan_mask = np.ones(len(self.points), dtype=bool)
+                dbscan_mask[noise_candidate_indices[noisy_subset_mask]] = False
+                combined_mask &= dbscan_mask
 
         # 5. Intensity Filter
         if self.active_filters["intensity"] and self.intensities is not None:
@@ -241,7 +333,7 @@ def run_interactive_filter(points, intensities=None):
     app = NoiseFilterApp(points, intensities)
     return app.run()
 
-def apply_headless_filter(points, intensities, params, active_filters):
+def apply_headless_filter(points, intensities, params, active_filters, return_num=None, total_returns=None):
     """
     Run the noise filters without a GUI using provided parameters.
     """
@@ -249,9 +341,12 @@ def apply_headless_filter(points, intensities, params, active_filters):
     pcd.points = o3d.utility.Vector3dVector(points[:, :3])
     combined_mask = np.ones(len(points), dtype=bool)
     
+    # Calculate Heights
+    ground_model = build_ground_model(points, return_num, total_returns)
+    heights = get_heights_above_ground(points, ground_model)
+    
     if active_filters.get("floor", False):
-        z_floor = np.percentile(points[:, 2], params["floor_percentile"])
-        combined_mask &= (points[:, 2] >= z_floor - params["floor_buffer"])
+        combined_mask &= (heights >= -params["floor_buffer"])
         
     if active_filters.get("ror", False):
         _, ind = pcd.remove_radius_outlier(nb_points=int(params["ror_min_points"]), 
@@ -266,9 +361,25 @@ def apply_headless_filter(points, intensities, params, active_filters):
         combined_mask &= m
         
     if active_filters.get("dbscan", False):
-        labels = np.array(pcd.cluster_dbscan(eps=params["dbscan_eps"], 
-                                            min_points=int(params["dbscan_min_points"])))
-        combined_mask &= (labels >= 0)
+        # Height and linearity protection
+        noise_cand_idx = np.where(heights > params["dbscan_base_alt"])[0]
+        if len(noise_cand_idx) > 0:
+            pcd_temp = o3d.geometry.PointCloud()
+            pcd_temp.points = o3d.utility.Vector3dVector(points[noise_cand_idx])
+            labels = np.array(pcd_temp.cluster_dbscan(eps=params["dbscan_eps"], 
+                                                    min_points=int(params["dbscan_min_points"])))
+            subset_noise = (labels < 0)
+            for i in range(labels.max() + 1):
+                c_idx = np.where(labels == i)[0]
+                if len(c_idx) < params["dbscan_min_points"]:
+                    subset_noise[c_idx] = True
+                else:
+                    lin = calculate_cluster_linearity(points[noise_cand_idx[c_idx]])
+                    if lin < params["dbscan_linearity"]:
+                        subset_noise[c_idx] = True
+            m = np.ones(len(points), dtype=bool)
+            m[noise_cand_idx[subset_noise]] = False
+            combined_mask &= m
         
     if active_filters.get("intensity", False) and intensities is not None:
         max_i = np.max(intensities) + 1e-6
