@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import copy
+import json
 from collections import OrderedDict
 
 # PointSSM / Pointcept imports
@@ -21,9 +22,56 @@ except ImportError:
 from scipy.spatial import cKDTree
 from noisefilter import run_interactive_filter, apply_headless_filter
 
-def build_ground_model(points, return_num, total_returns, grid_size=5.0):
+def load_filter_settings(path=".filter_settings.json"):
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except:
+            return None
+    return None
+
+def save_filter_settings(settings, path=".filter_settings.json"):
+    try:
+        with open(path, 'w') as f:
+            json.dump(settings, f, indent=4)
+    except Exception as e:
+        print(f"Warning: Could not save filter settings: {e}")
+
+def get_interactive_sample(points, intensities, return_num, total_returns, max_points=4000000):
+    """
+    Returns a central spatial crop of the points, capped at max_points.
+    Preserves density for accurate filter tuning.
+    """
+    if len(points) <= max_points:
+        return points, intensities, return_num, total_returns, False
+    
+    print(f"Large File detected ({len(points):,} points). Reducing to {max_points:,} for interactive tuning...")
+    
+    # Estimate crop size to hit target point count (2D assumption)
+    ratio = (max_points * 1.1) / len(points) # 10% buffer
+    spatial_ratio = np.sqrt(ratio)
+    
+    min_xyz = points.min(0)
+    max_xyz = points.max(0)
+    center = (min_xyz + max_xyz) / 2.0
+    half_size = (max_xyz - min_xyz) * spatial_ratio / 2.0
+    
+    mask = (np.abs(points[:, 0] - center[0]) < half_size[0]) & \
+           (np.abs(points[:, 1] - center[1]) < half_size[1])
+    
+    idx = np.where(mask)[0]
+    if len(idx) > max_points:
+        # Use random choice instead of slicing to avoid 'stripy' scan-line artifacts
+        idx = np.random.choice(idx, max_points, replace=False)
+    
+    print(f"  -> Using uniform spatial sample of {len(idx):,} points for GUI.")
+    return points[idx], intensities[idx], return_num[idx], total_returns[idx], True
+
+def build_ground_model(points, return_num, total_returns, grid_size=2.0):
     """
     Build a coarse ground model using last returns to provide a stable vertical datum.
+    Grid size reduced to 2.0m to better capture small structures (e.g. shelters).
     """
     print(f"Building Ground Reference Model (DTM) at {grid_size}m resolution...")
     # Filter for last returns (most likely to be ground)
@@ -41,18 +89,19 @@ def build_ground_model(points, return_num, total_returns, grid_size=5.0):
     nx = int(np.ceil((max_x - min_x) / grid_size)) + 1
     ny = int(np.ceil((max_y - min_y) / grid_size)) + 1
     
-    # Initialize with global 1st percentile to avoid underground noise
-    global_floor = np.percentile(ground_pts[:, 2], 1)
+    # Initialize with global 5th percentile to avoid deep underground noise
+    # Any cells without ground points will stay at this level
+    global_floor = np.percentile(ground_pts[:, 2], 5.0)
     grid = np.full((nx, ny), global_floor, dtype=np.float32)
     
     # Grid indexing
     gx = ((ground_pts[:, 0] - min_x) / grid_size).astype(int)
     gy = ((ground_pts[:, 1] - min_y) / grid_size).astype(int)
+    gx = np.clip(gx, 0, nx - 1)
+    gy = np.clip(gy, 0, ny - 1)
     
-    # Min-pooling for floor detection
-    for i in range(len(ground_pts)):
-        if ground_pts[i, 2] < grid[gx[i], gy[i]]:
-            grid[gx[i], gy[i]] = ground_pts[i, 2]
+    # Vectorized Min-pooling for floor detection (fixes performance for 10M+ points)
+    np.minimum.at(grid, (gx, gy), ground_pts[:, 2])
             
     return grid, (min_x, min_y), grid_size
 
@@ -112,35 +161,50 @@ def smooth_predictions(points, preds, k=30, z_threshold=2.0):
 persistent_filter_config = {
     "params": None,
     "active": None,
-    "apply_to_all": False
+    "apply_to_all": False,
+    "max_gui_points": 25000000 # Boosted for 12M+ full-tile visibility
 }
 
 def predict_las(las_file_path, model, transform, cfg, args):
     if laspy is None:
         raise ImportError("laspy is not installed. Please install it (pip install laspy[lazrs,pylas]).")
         
-    print(f"Loading {las_file_path}...")
+    print(f"Loading {las_file_path} (this may take a moment for 10M+ points)...")
     las = laspy.read(las_file_path)
     
-    # Extract Coordinates and Intensity
-    # Las files usually have coordinates scaled by header scale and added to offset. las.x gives actual float values.
-    points = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
+    # Extract Coordinates and Intensity - Maintain float64 for large GPS precision
+    print("  -> Extracting XYZ and Intensity...")
+    points = np.array(las.xyz) # Stay in float64
     intensities = np.array(las.intensity).astype(np.float32)
     
     # Extract return info for Ground Model
+    print("  -> Extracting Return Information...")
     try:
-        return_num = np.array(las.return_number)
-        total_returns = np.array(las.number_of_returns)
-    except AttributeError:
-        print("Warning: Return number information missing. Ground model will be less accurate.")
-        return_num = np.ones(len(points))
-        total_returns = np.ones(len(points))
+        # Using .array to bypass slow ScaledArrayView behavior in laspy v2
+        return_num = np.array(las.return_number.array if hasattr(las.return_number, 'array') else las.return_number)
+        total_returns = np.array(las.number_of_returns.array if hasattr(las.number_of_returns, 'array') else las.number_of_returns)
+    except Exception:
+        print("    ! Warning: Return number information missing or inaccessible.")
+        return_num = np.ones(len(points), dtype=np.uint8)
+        total_returns = np.ones(len(points), dtype=np.uint8)
 
     # Pre-calculate Ground Model (DTM)
+    print("  -> Building Global DTM for height-relative filtering...")
     ground_model = build_ground_model(points, return_num, total_returns)
     
     # Apply Noise Filter
     global persistent_filter_config
+    
+    # Initialize from disk if global state is empty
+    if persistent_filter_config["params"] is None:
+        saved = load_filter_settings()
+        if saved:
+            print("  -> Loaded persistent filter settings from .filter_settings.json")
+            persistent_filter_config["params"] = saved.get("params")
+            persistent_filter_config["active"] = saved.get("active")
+            # Force upgrade old 4M/10M limits to the new 25M default
+            persistent_filter_config["max_gui_points"] = max(saved.get("max_gui_points", 25000000), 25000000)
+
     if args.noise_filter in ["yes", "interactive"]:
         if persistent_filter_config["apply_to_all"]:
             print(f"Applying persistent filter settings to {os.path.basename(las_file_path)}...")
@@ -150,11 +214,42 @@ def predict_las(las_file_path, model, transform, cfg, args):
                                             return_num=return_num,
                                             total_returns=total_returns)
         else:
-            keep_mask, params, active, apply_to_all = run_interactive_filter(points, intensities)
-            if apply_to_all:
+            # Subsample for interactive performance if needed
+            print("  -> Preparing interactive subsample...")
+            gui_pts, gui_int, gui_ret, gui_tot, is_sampled = get_interactive_sample(
+                points, intensities, return_num, total_returns,
+                max_points=persistent_filter_config["max_gui_points"]
+            )
+            
+            # Pass existing persistent settings and return info to the GUI
+            print("  -> Launching Interactive Noise Filter GUI...")
+            keep_mask_gui, params, active, apply_to_all = run_interactive_filter(
+                gui_pts, gui_int,
+                initial_params=persistent_filter_config["params"],
+                initial_active=persistent_filter_config["active"],
+                return_num=gui_ret,
+                total_returns=gui_tot
+            )
+            if params:
                 persistent_filter_config["params"] = params
                 persistent_filter_config["active"] = active
+                # Persist settings + threshold
+                save_filter_settings({
+                    "params": params, 
+                    "active": active,
+                    "max_gui_points": persistent_filter_config["max_gui_points"]
+                }) 
+                
+            if apply_to_all:
                 persistent_filter_config["apply_to_all"] = True
+            
+            # Re-apply the found settings to the FULL point set
+            print(f"Applying settings to full tile ({len(points):,} points)...")
+            keep_mask = apply_headless_filter(points, intensities, 
+                                            persistent_filter_config["params"], 
+                                            persistent_filter_config["active"],
+                                            return_num=return_num,
+                                            total_returns=total_returns)
     else:
         keep_mask = np.ones(len(points), dtype=bool)
         
