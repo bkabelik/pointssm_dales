@@ -21,6 +21,55 @@ except ImportError:
 from scipy.spatial import cKDTree
 from noisefilter import run_interactive_filter, apply_headless_filter
 
+def build_ground_model(points, return_num, total_returns, grid_size=5.0):
+    """
+    Build a coarse ground model using last returns to provide a stable vertical datum.
+    """
+    print(f"Building Ground Reference Model (DTM) at {grid_size}m resolution...")
+    # Filter for last returns (most likely to be ground)
+    mask = (return_num == total_returns)
+    ground_pts = points[mask]
+    
+    if len(ground_pts) < 100:
+        print("  ! Warning: Insufficient 'last return' data. Using all points for ground estimate.")
+        ground_pts = points
+        
+    # Create grid
+    min_x, min_y = np.min(points[:, 0]), np.min(points[:, 1])
+    max_x, max_y = np.max(points[:, 0]), np.max(points[:, 1])
+    
+    nx = int(np.ceil((max_x - min_x) / grid_size)) + 1
+    ny = int(np.ceil((max_y - min_y) / grid_size)) + 1
+    
+    # Initialize with global 1st percentile to avoid underground noise
+    global_floor = np.percentile(ground_pts[:, 2], 1)
+    grid = np.full((nx, ny), global_floor, dtype=np.float32)
+    
+    # Grid indexing
+    gx = ((ground_pts[:, 0] - min_x) / grid_size).astype(int)
+    gy = ((ground_pts[:, 1] - min_y) / grid_size).astype(int)
+    
+    # Min-pooling for floor detection
+    for i in range(len(ground_pts)):
+        if ground_pts[i, 2] < grid[gx[i], gy[i]]:
+            grid[gx[i], gy[i]] = ground_pts[i, 2]
+            
+    return grid, (min_x, min_y), grid_size
+
+def get_floor_height(points, ground_model):
+    """
+    Lookup floor height from the pre-calculated DTM.
+    """
+    grid, (min_x, min_y), grid_size = ground_model
+    gx = ((points[:, 0] - min_x) / grid_size).astype(int)
+    gy = ((points[:, 1] - min_y) / grid_size).astype(int)
+    
+    # Clip to grid boundaries
+    gx = np.clip(gx, 0, grid.shape[0] - 1)
+    gy = np.clip(gy, 0, grid.shape[1] - 1)
+    
+    return grid[gx, gy]
+
 def parse_args():
     parser = argparse.ArgumentParser("PointSSM Predictor for LAS files")
     parser.add_argument("--folder", type=str, required=True, help="Folder containing .las files")
@@ -32,19 +81,30 @@ def parse_args():
     return parser.parse_args()
 
 
-def smooth_predictions(points, preds, k=30):
+def smooth_predictions(points, preds, k=30, z_threshold=2.0):
     """
-    Apply k-NN majority voting smoothing to predictions (good for overlapping flight strips).
+    Apply k-NN majority voting smoothing. 
+    Improved: Edge-preserving by ignoring neighbors with large height differences (e.g. Roof vs Ground).
     """
-    print(f"Applying k-NN (k={k}) smoothing to predictions...")
+    print(f"Applying edge-preserving k-NN (k={k}, dZ={z_threshold}m) smoothing...")
     tree = cKDTree(points)
-    _, indices = tree.query(points, k=k)
+    dists, indices = tree.query(points, k=k)
     
     smoothed_preds = np.zeros_like(preds)
     for i in range(len(preds)):
-        neighbors_preds = preds[indices[i]]
-        counts = np.bincount(neighbors_preds)
-        smoothed_preds[i] = np.argmax(counts)
+        neighbor_indices = indices[i]
+        
+        # Height-aware filtering: only consider neighbors within vertical range
+        z_diff = np.abs(points[neighbor_indices, 2] - points[i, 2])
+        valid_neighbors = neighbor_indices[z_diff < z_threshold]
+        
+        if len(valid_neighbors) > 0:
+            neighbors_preds = preds[valid_neighbors]
+            counts = np.bincount(neighbors_preds)
+            smoothed_preds[i] = np.argmax(counts)
+        else:
+            # Fallback to original if no geometric neighbors found
+            smoothed_preds[i] = preds[i]
     
     return smoothed_preds
 
@@ -66,6 +126,18 @@ def predict_las(las_file_path, model, transform, cfg, args):
     # Las files usually have coordinates scaled by header scale and added to offset. las.x gives actual float values.
     points = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
     intensities = np.array(las.intensity).astype(np.float32)
+    
+    # Extract return info for Ground Model
+    try:
+        return_num = np.array(las.return_number)
+        total_returns = np.array(las.number_of_returns)
+    except AttributeError:
+        print("Warning: Return number information missing. Ground model will be less accurate.")
+        return_num = np.ones(len(points))
+        total_returns = np.ones(len(points))
+
+    # Pre-calculate Ground Model (DTM)
+    ground_model = build_ground_model(points, return_num, total_returns)
     
     # Apply Noise Filter
     global persistent_filter_config
@@ -137,19 +209,22 @@ def predict_las(las_file_path, model, transform, cfg, args):
             local_center_x = (x_start + x_end) / 2.0
             local_center_y = (y_start + y_end) / 2.0
             
-            # Robust Bottom-anchor Z: Floors always at exactly 0.0 relative to the real ground
-            # Using 1st percentile to ignore underground multipath noise peaks
-            z_floor = np.percentile(block_points[:, 2], 1)
+            # Using stable DTM lookup for Consistent Z-Normalisation
+            # This prevents class flickering in overlapping regions
+            z_floors = get_floor_height(block_points, ground_model)
 
+            # Normalization logic: 
+            # Dividing by 25.0 maps the 50m block size (or radius 25m) to the [-1, 1] range.
+            # This is critical for activating the pre-trained weights correctly.
             block_points[:, 0] = (block_points[:, 0] - local_center_x) / 25.0
             block_points[:, 1] = (block_points[:, 1] - local_center_y) / 25.0
-            block_points[:, 2] = (block_points[:, 2] - z_floor) / 25.0
+            block_points[:, 2] = (block_points[:, 2] - z_floors) / 25.0
             
-            # Spatial weighting for overlap resolving
+            # Spatial weighting for overlap resolving: Squared distance for sharper transition
             dist_x = np.abs(block_points[:, 0])
             dist_y = np.abs(block_points[:, 1])
-            weights = 1.0 - np.maximum(dist_x, dist_y)
-            weights = np.clip(weights, 0.1, 1.0)
+            weights = (1.0 - np.maximum(dist_x, dist_y)) ** 2
+            weights = np.clip(weights, 0.01, 1.0)
             
             # Intensity normalization: Global scaling to maintain material contrast
             norm_intensities = np.clip(block_intensities / (global_intensity_max + 1e-6), 0, 1)
